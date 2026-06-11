@@ -10,9 +10,12 @@ from match_parser import extract_games, normalize_matches, normalize_participant
 from stats import build_summary, filter_rows
 from storage import (
     ensure_data_dirs,
+    load_json,
+    merge_rows_by_key,
     matches_csv_path,
     matches_sqlite_path,
     participants_csv_path,
+    read_rows_csv,
     raw_path,
     save_json,
     summary_path,
@@ -29,6 +32,7 @@ def dump_lcu_data(
     include_timelines: bool = False,
 ) -> dict[str, Any]:
     root = ensure_data_dirs(out)
+    _archive_existing_raw_batches(root)
     client = connect(lockfile)
 
     current = client.current_summoner()
@@ -67,25 +71,47 @@ def dump_lcu_data(
                 )
 
     save_json(raw_path(root, "game_details_raw.json"), detailed)
+    _archive_game_payloads(root, detailed, "game_details")
     if include_timelines:
         save_json(raw_path(root, "timelines_raw.json"), timelines)
+        _archive_game_payloads(root, timelines, "timelines")
     if errors:
         save_json(raw_path(root, "fetch_errors.json"), errors)
 
     source_games = detailed if detailed else games
     rows = normalize_matches(source_games, current)
     participant_rows = normalize_participants(source_games, current)
-    write_matches_csv(matches_csv_path(root), rows)
-    write_rows_csv(participants_csv_path(root), participant_rows)
-    write_matches_sqlite(matches_sqlite_path(root), rows, participant_rows)
+    existing_rows = read_rows_csv(matches_csv_path(root))
+    existing_participant_rows = read_rows_csv(participants_csv_path(root))
+    existing_match_ids = _match_ids(existing_rows)
+    fetched_match_ids = _match_ids(rows)
+    merged_rows = merge_rows_by_key(existing_rows, rows, ["match_id"])
+    merged_participant_rows = merge_rows_by_key(
+        existing_participant_rows,
+        participant_rows,
+        ["match_id", "participant_id"],
+    )
+
+    added_match_ids = fetched_match_ids - existing_match_ids
+    updated_match_ids = fetched_match_ids & existing_match_ids
+
+    write_matches_csv(matches_csv_path(root), merged_rows)
+    write_rows_csv(participants_csv_path(root), merged_participant_rows)
+    write_matches_sqlite(matches_sqlite_path(root), merged_rows, merged_participant_rows)
 
     summary = {
-        "all_queues": build_summary(rows),
-        "aram": build_summary(filter_rows(rows, aram_only=True)),
+        "all_queues": build_summary(merged_rows),
+        "aram": build_summary(filter_rows(merged_rows, aram_only=True)),
         "raw_games": len(games),
         "detailed_games": len(detailed),
-        "normalized_matches": len(rows),
-        "normalized_participants": len(participant_rows),
+        "fetched_matches": len(rows),
+        "fetched_participants": len(participant_rows),
+        "added_matches": len(added_match_ids),
+        "updated_matches": len(updated_match_ids),
+        "total_matches": len(merged_rows),
+        "total_participants": len(merged_participant_rows),
+        "normalized_matches": len(merged_rows),
+        "normalized_participants": len(merged_participant_rows),
         "errors": errors,
     }
     save_json(summary_path(root), summary)
@@ -96,11 +122,48 @@ def dump_lcu_data(
         "current_summoner": current,
         "raw_games": len(games),
         "detailed_games": len(detailed),
-        "normalized_matches": len(rows),
-        "normalized_participants": len(participant_rows),
+        "fetched_matches": len(rows),
+        "fetched_participants": len(participant_rows),
+        "added_matches": len(added_match_ids),
+        "updated_matches": len(updated_match_ids),
+        "total_matches": len(merged_rows),
+        "total_participants": len(merged_participant_rows),
+        "normalized_matches": len(merged_rows),
+        "normalized_participants": len(merged_participant_rows),
         "summary": summary,
         "errors": errors,
     }
+
+
+def _archive_existing_raw_batches(root: Path) -> None:
+    detail_batch = load_json(raw_path(root, "game_details_raw.json"), default=[])
+    if isinstance(detail_batch, list):
+        _archive_game_payloads(root, detail_batch, "game_details")
+
+    timeline_batch = load_json(raw_path(root, "timelines_raw.json"), default=[])
+    if isinstance(timeline_batch, list):
+        _archive_game_payloads(root, timeline_batch, "timelines")
+
+
+def _archive_game_payloads(root: Path, games: list[dict[str, Any]], dirname: str) -> None:
+    if not games:
+        return
+    for game in games:
+        if not isinstance(game, dict):
+            continue
+        game_id = _game_id(game)
+        if not game_id:
+            continue
+        save_json(raw_path(root, f"{dirname}/{game_id}.json"), game)
+
+
+def _game_id(game: dict[str, Any]) -> str:
+    value = game.get("gameId") or game.get("id") or game.get("matchId")
+    return str(value) if value is not None else ""
+
+
+def _match_ids(rows: list[dict[str, Any]]) -> set[str]:
+    return {str(row.get("match_id")).strip() for row in rows if str(row.get("match_id", "")).strip()}
 
 
 def main() -> int:
@@ -133,8 +196,12 @@ def main() -> int:
     print(f"Lockfile: {result['lockfile']}")
     print(f"Raw games: {result['raw_games']}")
     print(f"Detailed games: {result['detailed_games']}")
-    print(f"Normalized matches: {result['normalized_matches']}")
-    print(f"Normalized participants: {result['normalized_participants']}")
+    print(f"Fetched normalized matches: {result['fetched_matches']}")
+    print(f"Fetched participants: {result['fetched_participants']}")
+    print(f"Added matches: {result['added_matches']}")
+    print(f"Updated/deduped matches: {result['updated_matches']}")
+    print(f"Historical matches: {result['total_matches']}")
+    print(f"Historical participants: {result['total_participants']}")
     print(f"Saved to: {result['data_dir']}")
     if result["errors"]:
         print(f"Partial fetch errors: {len(result['errors'])} (see raw/fetch_errors.json)")

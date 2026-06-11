@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from llm_analysis import (
@@ -13,6 +14,7 @@ from llm_analysis import (
 
 
 def main() -> int:
+    _configure_stdout()
     parser = argparse.ArgumentParser(description="Generate an LLM ARAM analysis report.")
     parser.add_argument("--data", default="data", help="data directory")
     parser.add_argument(
@@ -23,8 +25,14 @@ def main() -> int:
     )
     parser.add_argument("--min-partner-games", type=int, default=2)
     parser.add_argument("--recent-games", type=int, default=50)
+    parser.add_argument(
+        "--squad-members",
+        default=None,
+        help="comma-separated squad member names; overrides LLM_SQUAD_MEMBERS",
+    )
     parser.add_argument("--model", default=None, help="override LLM_MODEL")
     parser.add_argument("--max-output-tokens", type=int, default=None, help="override LLM_MAX_OUTPUT_TOKENS")
+    parser.add_argument("--timeout", type=int, default=None, help="override LLM_TIMEOUT_SECONDS")
     parser.add_argument(
         "--reasoning-effort",
         default=None,
@@ -46,6 +54,7 @@ def main() -> int:
                 data_dir=args.data,
                 min_partner_games=args.min_partner_games,
                 recent_games=args.recent_games,
+                squad_member_names=args.squad_members,
             )
             print(
                 {
@@ -53,8 +62,10 @@ def main() -> int:
                     "participants": payload["metadata"]["participant_count"],
                     "frequent_allies": len(payload["frequent_allies"]),
                     "players_for_equal_analysis": len(payload["players_for_equal_analysis"]),
+                    "detected_squad_members": payload["metadata"].get("detected_squad_members"),
                     "skills": skill_paths,
                     "max_output_tokens": args.max_output_tokens,
+                    "timeout": args.timeout,
                     "reasoning_effort": args.reasoning_effort,
                 }
             )
@@ -65,9 +76,11 @@ def main() -> int:
             skill_path=[Path(path) for path in skill_paths],
             min_partner_games=args.min_partner_games,
             recent_games=args.recent_games,
+            squad_member_names=args.squad_members,
             model=args.model,
             max_output_tokens=args.max_output_tokens,
             reasoning_effort=args.reasoning_effort,
+            timeout=args.timeout,
         )
     except LLMAnalysisError as exc:
         print(f"LLM analysis error: {exc}")
@@ -75,6 +88,14 @@ def main() -> int:
 
     print(result["report"])
     return 0
+
+
+def _configure_stdout() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

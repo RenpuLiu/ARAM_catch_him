@@ -11,6 +11,8 @@ import streamlit as st
 from datadragon import load_static_maps
 from llm_analysis import (
     DEFAULT_MAX_OUTPUT_TOKENS,
+    DEFAULT_SQUAD_MEMBER_NAMES,
+    DEFAULT_TIMEOUT_SECONDS,
     LLMAnalysisError,
     build_analysis_payload,
     build_llm_user_input,
@@ -121,8 +123,11 @@ def main() -> None:
                         include_timelines=include_timelines,
                     )
                     st.success(
-                        f"已更新 {result['normalized_matches']} 局，"
-                        f"{result['normalized_participants']} 条玩家记录。"
+                        f"本次抓取 {result.get('fetched_matches', 0)} 局，"
+                        f"新增 {result.get('added_matches', 0)} 局，"
+                        f"更新/去重 {result.get('updated_matches', 0)} 局；"
+                        f"历史共 {result.get('total_matches', result['normalized_matches'])} 局，"
+                        f"{result.get('total_participants', result['normalized_participants'])} 条玩家记录。"
                     )
                     if result["errors"]:
                         st.warning(
@@ -233,6 +238,12 @@ def _llm_tab(data_dir: str) -> None:
     with config_cols[2]:
         min_partner_games = st.number_input("常见队友阈值", min_value=1, max_value=20, value=2, step=1)
 
+    squad_members_text = st.text_input(
+        "车队成员",
+        value=os.getenv("LLM_SQUAD_MEMBERS", ", ".join(DEFAULT_SQUAD_MEMBER_NAMES)),
+        help="逗号分隔；这些成员只要出现在数据里，就会进入同维度分析。",
+    )
+
     api_cols = st.columns([1, 1, 1])
     with api_cols[0]:
         model = st.text_input("模型", value=os.getenv("LLM_MODEL", "gpt-5.4"))
@@ -245,7 +256,7 @@ def _llm_tab(data_dir: str) -> None:
     with api_cols[2]:
         base_url = st.text_input("Base URL", value=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"))
 
-    generation_cols = st.columns([1, 1])
+    generation_cols = st.columns([1, 1, 1])
     with generation_cols[0]:
         max_output_tokens = st.number_input(
             "输出 token 上限",
@@ -256,6 +267,15 @@ def _llm_tab(data_dir: str) -> None:
             help="报告被截断时调高这个值。",
         )
     with generation_cols[1]:
+        timeout_seconds = st.number_input(
+            "API 超时秒数",
+            min_value=60,
+            max_value=1800,
+            value=_env_positive_int("LLM_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS),
+            step=60,
+            help="长报告生成较慢时调高这个值。",
+        )
+    with generation_cols[2]:
         reasoning_options = _reasoning_effort_options()
         reasoning_effort = st.selectbox(
             "推理强度",
@@ -280,6 +300,7 @@ def _llm_tab(data_dir: str) -> None:
             data_dir=data_dir,
             min_partner_games=int(min_partner_games),
             recent_games=int(recent_games),
+            squad_member_names=squad_members_text,
         )
     except LLMAnalysisError as exc:
         st.error(str(exc))
@@ -289,7 +310,8 @@ def _llm_tab(data_dir: str) -> None:
     st.caption(
         f"将分析 {meta['match_count']} 局、{meta['participant_count']} 条玩家记录；"
         f"识别到 {len(payload['frequent_allies'])} 个常见队友/疑似多排；"
-        f"同维度玩家分析 {len(payload['players_for_equal_analysis'])} 人。"
+        f"同维度玩家分析 {len(payload['players_for_equal_analysis'])} 人；"
+        f"命中车队成员 {len(payload['metadata'].get('detected_squad_members', []))} 人。"
     )
 
     preview_cols = st.columns(2)
@@ -322,6 +344,7 @@ def _llm_tab(data_dir: str) -> None:
                     api_style=api_style,
                     max_output_tokens=int(max_output_tokens),
                     reasoning_effort=None if reasoning_effort == "default" else reasoning_effort,
+                    timeout=int(timeout_seconds),
                 )
                 report_path = save_report(data_dir, report, payload, raw_response)
             except LLMAnalysisError as exc:

@@ -55,12 +55,55 @@ def write_rows_csv(path: str | Path, rows: list[dict[str, Any]]) -> None:
 
 
 def read_matches_csv(path: str | Path) -> list[dict[str, str]]:
+    return read_rows_csv(path)
+
+
+def read_rows_csv(path: str | Path) -> list[dict[str, str]]:
     target = Path(path)
     if not target.exists() or target.stat().st_size == 0:
         return []
 
     with target.open("r", newline="", encoding="utf-8-sig") as handle:
         return list(csv.DictReader(handle))
+
+
+def merge_rows_by_key(
+    existing_rows: list[dict[str, Any]],
+    new_rows: list[dict[str, Any]],
+    key_fields: list[str] | tuple[str, ...],
+    sort_field: str = "game_creation_ms",
+) -> list[dict[str, Any]]:
+    merged: dict[tuple[str, ...], dict[str, Any]] = {}
+
+    for row in existing_rows:
+        key = _row_key(row, key_fields)
+        if key:
+            merged[key] = row
+
+    for row in new_rows:
+        key = _row_key(row, key_fields)
+        if key:
+            merged[key] = row
+
+    return sorted(
+        merged.values(),
+        key=lambda row: _sort_value(row.get(sort_field)),
+        reverse=True,
+    )
+
+
+def _row_key(row: dict[str, Any], key_fields: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    values = tuple(_stringify(row.get(field)).strip() for field in key_fields)
+    if not values or any(not value for value in values):
+        return ()
+    return values
+
+
+def _sort_value(value: Any) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
 
 
 def write_matches_sqlite(
@@ -71,7 +114,8 @@ def write_matches_sqlite(
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    with sqlite3.connect(target) as conn:
+    conn = sqlite3.connect(target)
+    try:
         _write_table(conn, "matches", rows)
         _write_table(conn, "participants", participant_rows or [])
         conn.execute('CREATE INDEX IF NOT EXISTS idx_matches_id ON matches("match_id")')
@@ -82,6 +126,9 @@ def write_matches_sqlite(
             conn.execute(
                 'CREATE INDEX IF NOT EXISTS idx_participants_summoner_id ON participants("summoner_id")'
             )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def raw_path(data_dir: str | Path, filename: str) -> Path:

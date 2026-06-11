@@ -3,17 +3,22 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
+import requests
 
 from llm_analysis import (
+    LLMAnalysisError,
     build_analysis_payload,
     build_llm_user_input,
     list_analysis_skills,
     load_combined_skill_prompt,
     load_local_env,
     load_skill_prompt,
+    _post_json,
     _resolve_max_output_tokens,
+    _resolve_timeout_seconds,
     _with_truncation_notice,
 )
 from storage import participants_csv_path, matches_csv_path, write_matches_csv, write_rows_csv
@@ -23,8 +28,8 @@ class LLMAnalysisTests(unittest.TestCase):
     def test_load_default_skill_prompt(self) -> None:
         prompt = load_skill_prompt()
 
-        self.assertIn("ARAM performance analyst", prompt)
-        self.assertIn("常见队友", prompt)
+        self.assertIn("车队复盘分析师", prompt)
+        self.assertIn("车队", prompt)
 
     def test_load_combined_skill_prompt_combines_multiple_skills(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -171,6 +176,117 @@ class LLMAnalysisTests(unittest.TestCase):
         self.assertEqual("self", payload["players_for_equal_analysis"][0]["role"])
         self.assertEqual(2, len(payload["recent_performance_ranking_seed"]))
 
+    def test_build_analysis_payload_includes_named_squad_member_below_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            cache = data / "cache"
+            cache.mkdir()
+            cache.joinpath("ddragon_zh_CN.json").write_text(
+                """
+{
+  "version": "test",
+  "champions": {},
+  "items": {
+    "3083": {"name": "狂徒铠甲"},
+    "3158": {"name": "明朗之靴"}
+  },
+  "summoner_spells": {
+    "4": {"key": "4", "name": "闪现"},
+    "32": {"key": "32", "name": "标记"}
+  }
+}
+""",
+                encoding="utf-8",
+            )
+            write_matches_csv(
+                matches_csv_path(data),
+                [{"match_id": "1", "game_creation_ms": 1, "win": True}],
+            )
+            write_rows_csv(
+                participants_csv_path(data),
+                [
+                    {
+                        "match_id": "1",
+                        "side": "self",
+                        "team_id": 100,
+                        "riot_id": "Me#CN1",
+                        "summoner_id": "me",
+                        "champion_name": "A",
+                        "win": True,
+                        "kills": 10,
+                        "deaths": 4,
+                        "assists": 20,
+                        "kda": 7.5,
+                        "duration_minutes": 20,
+                        "damage_to_champions": 30000,
+                        "damage_taken": 18000,
+                        "damage_self_mitigated": 8000,
+                        "total_heal": 1000,
+                        "time_ccing_others": 10,
+                        "gold_earned": 15000,
+                        "spell1_id": 4,
+                        "spell2_id": 32,
+                    },
+                    {
+                        "match_id": "1",
+                        "side": "ally",
+                        "team_id": 100,
+                        "riot_id": "tbc02#CN1",
+                        "summoner_id": "tbc02-id",
+                        "champion_name": "Malphite",
+                        "win": True,
+                        "kills": 6,
+                        "deaths": 8,
+                        "assists": 25,
+                        "kda": 3.875,
+                        "duration_minutes": 20,
+                        "damage_to_champions": 18000,
+                        "damage_taken": 42000,
+                        "damage_self_mitigated": 32000,
+                        "total_heal": 500,
+                        "time_ccing_others": 35,
+                        "gold_earned": 12000,
+                        "spell1_id": 4,
+                        "spell2_id": 32,
+                        "item0": 3083,
+                        "item1": 3158,
+                    },
+                    {
+                        "match_id": "1",
+                        "side": "enemy",
+                        "team_id": 200,
+                        "riot_id": "Enemy#CN1",
+                        "summoner_id": "enemy",
+                        "champion_name": "C",
+                        "win": False,
+                        "kills": 2,
+                        "deaths": 10,
+                        "assists": 8,
+                        "kda": 1,
+                        "duration_minutes": 20,
+                        "damage_to_champions": 12000,
+                        "damage_taken": 20000,
+                    },
+                ],
+            )
+
+            payload = build_analysis_payload(
+                data,
+                min_partner_games=2,
+                squad_member_names="tbc02,tbc05",
+            )
+
+        profiles = payload["players_for_equal_analysis"]
+        tbc02_profile = next(profile for profile in profiles if profile["identity"]["riot_id"] == "tbc02#CN1")
+        self.assertEqual("squad_member", tbc02_profile["role"])
+        self.assertTrue(tbc02_profile["is_named_squad_member"])
+        self.assertEqual(["tbc02"], payload["metadata"]["detected_squad_members"])
+        self.assertEqual("named_squad_member", payload["frequent_allies"][0]["partner_type"])
+        self.assertIn("function_mix", tbc02_profile)
+        self.assertEqual("前排开团", tbc02_profile["champion_function_profiles"][0]["observed_function_zh"])
+        self.assertEqual("狂徒铠甲", tbc02_profile["items"][0]["item_name"])
+        self.assertEqual(["闪现", "标记"], tbc02_profile["spells"][0]["names"])
+
     def test_build_llm_user_input_serializes_pandas_numpy_scalars(self) -> None:
         payload = {
             "value": pd.Series([1], dtype="int64").iloc[0],
@@ -196,6 +312,31 @@ class LLMAnalysisTests(unittest.TestCase):
                 os.environ.pop("LLM_MAX_OUTPUT_TOKENS", None)
             else:
                 os.environ["LLM_MAX_OUTPUT_TOKENS"] = old_value
+
+    def test_resolve_timeout_seconds_reads_env(self) -> None:
+        import os
+
+        old_value = os.environ.get("LLM_TIMEOUT_SECONDS")
+        try:
+            os.environ["LLM_TIMEOUT_SECONDS"] = "900"
+
+            self.assertEqual(900, _resolve_timeout_seconds(None))
+            self.assertEqual(120, _resolve_timeout_seconds(120))
+        finally:
+            if old_value is None:
+                os.environ.pop("LLM_TIMEOUT_SECONDS", None)
+            else:
+                os.environ["LLM_TIMEOUT_SECONDS"] = old_value
+
+    def test_post_json_wraps_timeout(self) -> None:
+        with patch("llm_analysis.requests.post", side_effect=requests.ReadTimeout("slow")):
+            with self.assertRaisesRegex(LLMAnalysisError, "timed out"):
+                _post_json(
+                    url="https://api.openai.com/v1/responses",
+                    api_key="test-key",
+                    body={"model": "test"},
+                    timeout=1,
+                )
 
     def test_truncation_notice_is_prepended_to_incomplete_response(self) -> None:
         text = _with_truncation_notice(

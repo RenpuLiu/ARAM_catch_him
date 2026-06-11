@@ -13,6 +13,7 @@ from typing import Any
 
 import requests
 
+from datadragon import load_static_maps
 from storage import matches_csv_path, participants_csv_path
 
 
@@ -22,6 +23,8 @@ REPORTS_DIRNAME = "reports"
 ENV_FILES = (".env", ".env.local")
 DEFAULT_MAX_OUTPUT_TOKENS = 8000
 DEFAULT_REASONING_EFFORT = ""
+DEFAULT_TIMEOUT_SECONDS = 600
+DEFAULT_SQUAD_MEMBER_NAMES = ("tbc02", "tbc05", "tbc06", "姬载紫", "热烈后变飞灰")
 
 
 class LLMAnalysisError(RuntimeError):
@@ -123,10 +126,14 @@ def build_analysis_payload(
     data_dir: str | Path = "data",
     min_partner_games: int = 2,
     recent_games: int = 50,
+    squad_member_names: str | list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     import pandas as pd
 
+    load_local_env()
+    squad_member_names = _resolve_squad_member_names(squad_member_names)
     data_dir = Path(data_dir)
+    static_maps = _load_static_maps_for_payload(data_dir)
     matches_path = matches_csv_path(data_dir)
     participants_path = participants_csv_path(data_dir)
     if not matches_path.exists():
@@ -140,6 +147,7 @@ def build_analysis_payload(
         raise LLMAnalysisError("No match or participant rows available.")
 
     matches = _sort_recent(matches).head(recent_games)
+    participants = _enrich_static_names_for_payload(participants, static_maps)
     match_ids = set(matches["match_id"].astype(str))
     participants = participants[participants["match_id"].astype(str).isin(match_ids)]
     self_rows = participants[participants.get("side", "") == "self"].copy()
@@ -156,11 +164,15 @@ def build_analysis_payload(
         ally_rows=ally_rows,
         team_context=team_context,
         min_partner_games=min_partner_games,
+        squad_member_names=squad_member_names,
+        static_maps=static_maps,
     )
     player_profiles = _players_for_equal_analysis(
         self_rows=self_rows,
         ally_rows=ally_rows,
         min_partner_games=min_partner_games,
+        squad_member_names=squad_member_names,
+        static_maps=static_maps,
     )
 
     payload = {
@@ -171,14 +183,32 @@ def build_analysis_payload(
             "participant_count": int(len(participants)),
             "min_partner_games": int(min_partner_games),
             "recent_games_limit": int(recent_games),
+            "squad_member_names": squad_member_names,
+            "detected_squad_members": _detected_squad_members(player_profiles, squad_member_names),
             "note": "Frequent allies are inferred from repeated ally rows, not confirmed premade party data.",
+        },
+        "analysis_method": {
+            "primary_unit": "车队成员",
+            "language": "最终报告必须使用中文。不要在正文里直接暴露英文枚举值或 JSON 字段名。",
+            "metric_glossary_zh": _metric_glossary_zh(),
+            "player_scope": "对 players_for_equal_analysis 中每个人做同等深度分析。",
+            "role_context": (
+                "不要只用跨英雄原始平均值判断。请结合 function_mix 和 "
+                "champion_function_profiles，在英雄职责上下文里比较伤害、承伤、死亡、控制、"
+                "治疗和参团。"
+            ),
         },
         "user": {
             "identity": _identity_summary(self_rows),
             "overall": _performance_summary(self_rows),
-            "champions": _top_champions(self_rows),
-            "spells": _top_pairs(self_rows, ["spell1_id", "spell2_id"], limit=8),
-            "items": _top_items(self_rows, limit=16),
+            "champions": _top_champions(self_rows, static_maps=static_maps),
+            "spells": _top_pairs(
+                self_rows,
+                ["spell1_id", "spell2_id"],
+                limit=8,
+                value_maps=[static_maps.get("summoner_spells", {}), static_maps.get("summoner_spells", {})],
+            ),
+            "items": _top_items(self_rows, limit=16, item_map=static_maps.get("items", {})),
             "style_signals": _style_signals(self_rows),
             "recent_matches": _recent_match_summaries(matches, self_rows),
         },
@@ -187,7 +217,7 @@ def build_analysis_payload(
         "frequent_allies": partner_summaries,
         "opponent_context": {
             "enemy_avg": _performance_summary(enemy_rows),
-            "enemy_top_champions": _top_champions(enemy_rows, limit=12),
+            "enemy_top_champions": _top_champions(enemy_rows, limit=12, static_maps=static_maps),
         },
     }
     return _json_safe(payload)
@@ -196,10 +226,14 @@ def build_analysis_payload(
 def build_llm_user_input(payload: dict[str, Any]) -> str:
     safe_payload = _json_safe(payload)
     return (
-        "请基于下面的 JSON 数据做 ARAM 对局分析。重点分析用户本人、常见队友/疑似多排、"
-        "搭配表现、平均表现、游戏风格和可执行建议。"
-        "请对 players_for_equal_analysis 里的每个人使用相同维度分析，"
-        "并基于 recent_performance_ranking_seed 与证据生成最近表现排序。\n\n"
+        "请基于下面的 JSON 数据做 ARAM 车队复盘。分析对象是整个车队，而不是只分析用户本人。"
+        "请对 players_for_equal_analysis 里的每个人使用完全相同的维度和篇幅，"
+        "尤其关注 metadata.squad_member_names 中出现并被检测到的成员。"
+        "不要把跨英雄平均伤害/平均承伤当作核心结论；必须优先按 function_mix 和 "
+        "champion_function_profiles 中的英雄功能/职责上下文分析表现。"
+        "输出职责时优先使用 *_zh 字段或中文名称；装备和召唤师技能优先使用 item_name / names，"
+        "不要只展示 ID。"
+        "请基于 recent_performance_ranking_seed 与职责化证据生成最近表现排序。\n\n"
         "数据：\n"
         f"{json.dumps(safe_payload, ensure_ascii=False, indent=2)}"
     )
@@ -214,7 +248,7 @@ def call_llm(
     api_style: str | None = None,
     max_output_tokens: int | None = None,
     reasoning_effort: str | None = None,
-    timeout: int = 600,
+    timeout: int | None = None,
 ) -> tuple[str, dict[str, Any]]:
     load_local_env()
     api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY")
@@ -226,6 +260,7 @@ def call_llm(
     api_style = (api_style or os.getenv("LLM_API_STYLE") or "responses").strip().lower()
     max_output_tokens = _resolve_max_output_tokens(max_output_tokens)
     reasoning_effort = _resolve_reasoning_effort(reasoning_effort)
+    timeout = _resolve_timeout_seconds(timeout)
 
     if api_style == "chat":
         response = _call_chat_completions(
@@ -259,15 +294,18 @@ def generate_analysis_report(
     skill_path: str | Path | list[str | Path] | tuple[str | Path, ...] = DEFAULT_SKILL_PATH,
     min_partner_games: int = 2,
     recent_games: int = 50,
+    squad_member_names: str | list[str] | tuple[str, ...] | None = None,
     dry_run: bool = False,
     model: str | None = None,
     max_output_tokens: int | None = None,
     reasoning_effort: str | None = None,
+    timeout: int | None = None,
 ) -> dict[str, Any]:
     payload = build_analysis_payload(
         data_dir=data_dir,
         min_partner_games=min_partner_games,
         recent_games=recent_games,
+        squad_member_names=squad_member_names,
     )
     skill_paths = _normalize_skill_paths(skill_path)
     system_prompt = load_combined_skill_prompt(skill_paths)
@@ -290,6 +328,7 @@ def generate_analysis_report(
         model=model,
         max_output_tokens=max_output_tokens,
         reasoning_effort=reasoning_effort,
+        timeout=timeout,
     )
     result["report"] = report
     result["raw_response"] = raw_response
@@ -340,13 +379,12 @@ def _call_responses(
     if reasoning_effort:
         body["reasoning"] = {"effort": reasoning_effort}
 
-    response = requests.post(
-        f"{base_url}/responses",
-        headers=_headers(api_key),
-        json=body,
+    return _post_json(
+        url=f"{base_url}/responses",
+        api_key=api_key,
+        body=body,
         timeout=timeout,
     )
-    return _checked_json(response)
 
 
 def _call_chat_completions(
@@ -358,10 +396,10 @@ def _call_chat_completions(
     max_output_tokens: int,
     timeout: int,
 ) -> dict[str, Any]:
-    response = requests.post(
-        f"{base_url}/chat/completions",
-        headers=_headers(api_key),
-        json={
+    return _post_json(
+        url=f"{base_url}/chat/completions",
+        api_key=api_key,
+        body={
             "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -372,13 +410,34 @@ def _call_chat_completions(
         },
         timeout=timeout,
     )
+
+
+def _post_json(url: str, api_key: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:
+    try:
+        response = requests.post(
+            url,
+            headers=_headers(api_key),
+            json=body,
+            timeout=timeout,
+        )
+    except requests.Timeout as exc:
+        raise LLMAnalysisError(
+            f"LLM API request timed out after {timeout} seconds. "
+            "Try increasing LLM_TIMEOUT_SECONDS, lowering LLM_MAX_OUTPUT_TOKENS, "
+            "or reducing the number of analyzed games."
+        ) from exc
+    except requests.RequestException as exc:
+        raise LLMAnalysisError(f"LLM API request failed: {exc}") from exc
     return _checked_json(response)
 
 
 def _checked_json(response: requests.Response) -> dict[str, Any]:
     if response.status_code >= 400:
         raise LLMAnalysisError(f"LLM API error {response.status_code}: {response.text[:1200]}")
-    return response.json()
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise LLMAnalysisError(f"LLM API returned non-JSON response: {response.text[:1200]}") from exc
 
 
 def _headers(api_key: str) -> dict[str, str]:
@@ -395,6 +454,15 @@ def _resolve_max_output_tokens(value: int | None) -> int:
     if raw_value is None or not raw_value.strip():
         return DEFAULT_MAX_OUTPUT_TOKENS
     return _coerce_positive_int(raw_value, "LLM_MAX_OUTPUT_TOKENS")
+
+
+def _resolve_timeout_seconds(value: int | None) -> int:
+    if value is not None:
+        return _coerce_positive_int(value, "timeout")
+    raw_value = os.getenv("LLM_TIMEOUT_SECONDS")
+    if raw_value is None or not raw_value.strip():
+        return DEFAULT_TIMEOUT_SECONDS
+    return _coerce_positive_int(raw_value, "LLM_TIMEOUT_SECONDS")
 
 
 def _coerce_positive_int(value: Any, name: str) -> int:
@@ -544,6 +612,8 @@ def _partner_summaries(
     ally_rows: Any,
     team_context: dict[tuple[str, int], dict[str, float]],
     min_partner_games: int,
+    squad_member_names: list[str] | None = None,
+    static_maps: dict[str, dict[int, str]] | None = None,
 ) -> list[dict[str, Any]]:
     if ally_rows.empty:
         return []
@@ -552,7 +622,8 @@ def _partner_summaries(
     ally_rows["partner_key"] = ally_rows.apply(_partner_key, axis=1)
     summaries = []
     for partner_key, partner_rows in ally_rows.groupby("partner_key"):
-        if len(partner_rows) < min_partner_games:
+        is_squad_member = _rows_match_any_name(partner_rows, squad_member_names or [])
+        if len(partner_rows) < min_partner_games and not is_squad_member:
             continue
         match_ids = set(partner_rows["match_id"].astype(str))
         user_with_partner = self_rows[self_rows["match_id"].astype(str).isin(match_ids)]
@@ -561,14 +632,15 @@ def _partner_summaries(
         summaries.append(
             {
                 "partner": _partner_identity(partner_rows),
+                "partner_type": "named_squad_member" if is_squad_member else "frequent_ally",
                 "games_together": int(len(match_ids)),
                 "wins_together": int(_bool_sum(together_matches, "win")),
                 "winrate_together": _ratio(_bool_sum(together_matches, "win"), len(match_ids)),
                 "user_when_together": _performance_summary(user_with_partner),
                 "partner_average": _performance_summary(partner_rows),
                 "combined": _combined_summary(user_with_partner, partner_rows, team_context),
-                "partner_champions": _top_champions(partner_rows, limit=8),
-                "user_champions_with_partner": _top_champions(user_with_partner, limit=8),
+                "partner_champions": _top_champions(partner_rows, limit=8, static_maps=static_maps),
+                "user_champions_with_partner": _top_champions(user_with_partner, limit=8, static_maps=static_maps),
                 "recent_match_ids": list(sorted(match_ids, reverse=True))[:8],
             }
         )
@@ -584,8 +656,18 @@ def _players_for_equal_analysis(
     self_rows: Any,
     ally_rows: Any,
     min_partner_games: int,
+    squad_member_names: list[str] | None = None,
+    static_maps: dict[str, dict[int, str]] | None = None,
 ) -> list[dict[str, Any]]:
-    profiles = [_player_profile("self", self_rows)]
+    squad_member_names = squad_member_names or []
+    profiles = [
+        _player_profile(
+            "self",
+            self_rows,
+            squad_member_names=squad_member_names,
+            static_maps=static_maps,
+        )
+    ]
     if ally_rows.empty:
         return profiles
 
@@ -593,29 +675,55 @@ def _players_for_equal_analysis(
     ally_rows["partner_key"] = ally_rows.apply(_partner_key, axis=1)
     partner_profiles = []
     for _, partner_rows in ally_rows.groupby("partner_key"):
-        if len(partner_rows) < min_partner_games:
+        is_squad_member = _rows_match_any_name(partner_rows, squad_member_names)
+        if len(partner_rows) < min_partner_games and not is_squad_member:
             continue
-        partner_profiles.append(_player_profile("frequent_ally", partner_rows))
+        role = "squad_member" if is_squad_member else "frequent_ally"
+        partner_profiles.append(
+            _player_profile(
+                role,
+                partner_rows,
+                squad_member_names=squad_member_names,
+                static_maps=static_maps,
+            )
+        )
 
     partner_profiles.sort(
         key=lambda profile: (
-            profile.get("overall", {}).get("games") or 0,
-            profile.get("overall", {}).get("winrate") or 0,
+            0 if profile.get("role") == "squad_member" else 1,
+            _squad_member_order(profile, squad_member_names),
+            -(profile.get("overall", {}).get("games") or 0),
+            -(profile.get("overall", {}).get("winrate") or 0),
         ),
-        reverse=True,
     )
     return profiles + partner_profiles[:12]
 
 
-def _player_profile(role: str, rows: Any) -> dict[str, Any]:
+def _player_profile(
+    role: str,
+    rows: Any,
+    squad_member_names: list[str] | None = None,
+    static_maps: dict[str, dict[int, str]] | None = None,
+) -> dict[str, Any]:
+    static_maps = static_maps or {}
     identity = _identity_summary(rows) if role == "self" else _partner_identity(rows)
+    champion_function_profiles = _champion_function_profiles(rows, limit=14, static_maps=static_maps)
     return {
         "role": role,
+        "role_zh": _role_zh(role),
+        "is_named_squad_member": _identity_matches_any_name(identity, squad_member_names or []),
         "identity": identity,
         "overall": _performance_summary(rows),
-        "champions": _top_champions(rows, limit=10),
-        "spells": _top_pairs(rows, ["spell1_id", "spell2_id"], limit=6),
-        "items": _top_items(rows, limit=12),
+        "champions": _top_champions(rows, limit=10, static_maps=static_maps),
+        "function_mix": _function_mix(champion_function_profiles),
+        "champion_function_profiles": champion_function_profiles,
+        "spells": _top_pairs(
+            rows,
+            ["spell1_id", "spell2_id"],
+            limit=6,
+            value_maps=[static_maps.get("summoner_spells", {}), static_maps.get("summoner_spells", {})],
+        ),
+        "items": _top_items(rows, limit=12, item_map=static_maps.get("items", {})),
         "style_signals": _style_signals(rows),
         "recent_matches": _recent_player_match_summaries(rows, limit=10),
     }
@@ -631,9 +739,11 @@ def _recent_performance_ranking_seed(profiles: list[dict[str, Any]]) -> list[dic
             {
                 "player": identity.get("riot_id") or identity.get("summoner_name") or "",
                 "role": profile.get("role", ""),
+                "is_named_squad_member": profile.get("is_named_squad_member"),
                 "games": overall.get("games"),
                 "score": score,
                 "score_note": "Heuristic seed only; final report should rank with evidence and confidence.",
+                "primary_functions": (profile.get("function_mix") or [])[:3],
                 "winrate": overall.get("winrate"),
                 "avg_kda": overall.get("avg_kda"),
                 "avg_damage_share": overall.get("avg_damage_share"),
@@ -822,43 +932,410 @@ def _recent_player_match_summaries(rows: Any, limit: int = 10) -> list[dict[str,
     return output
 
 
-def _top_champions(rows: Any, limit: int = 12) -> list[dict[str, Any]]:
+def _champion_function_profiles(
+    rows: Any,
+    limit: int = 14,
+    static_maps: dict[str, dict[int, str]] | None = None,
+) -> list[dict[str, Any]]:
     if rows.empty or "champion_name" not in rows.columns:
         return []
+    static_maps = static_maps or {}
     output = []
     for champion, group in rows.groupby("champion_name"):
-        output.append(
-            {
-                "champion": _clean(champion),
-                "games": int(len(group)),
-                "winrate": _ratio(_bool_sum(group, "win"), len(group)),
-                "avg_kda": _mean(group, "kda"),
-                "avg_damage": _mean(group, "damage_to_champions"),
-                "avg_deaths": _mean(group, "deaths"),
-            }
-        )
+        output.append(_champion_function_profile(champion, group, static_maps=static_maps))
     return sorted(output, key=lambda row: (row["games"], row["winrate"] or 0), reverse=True)[:limit]
 
 
-def _top_pairs(rows: Any, columns: list[str], limit: int = 8) -> list[dict[str, Any]]:
+def _champion_function_profile(
+    champion: Any,
+    group: Any,
+    static_maps: dict[str, dict[int, str]] | None = None,
+) -> dict[str, Any]:
+    static_maps = static_maps or {}
+    item_map = static_maps.get("items", {})
+    profile = {
+        "champion": _clean(champion),
+        "games": int(len(group)),
+        "wins": int(_bool_sum(group, "win")),
+        "winrate": _ratio(_bool_sum(group, "win"), len(group)),
+        "avg_kda": _mean(group, "kda"),
+        "avg_kills": _mean(group, "kills"),
+        "avg_deaths": _mean(group, "deaths"),
+        "avg_assists": _mean(group, "assists"),
+        "avg_damage": _mean(group, "damage_to_champions"),
+        "avg_damage_taken": _mean(group, "damage_taken"),
+        "avg_damage_share": _mean(group, "damage_share"),
+        "avg_damage_taken_share": _mean(group, "damage_taken_share"),
+        "avg_kill_participation": _mean(group, "kill_participation"),
+        "avg_cc_time": _mean(group, "time_ccing_others"),
+        "avg_heal": _mean(group, "total_heal"),
+        "avg_damage_mitigated": _mean(group, "damage_self_mitigated"),
+        "deaths_per_10_min": _per_10(group, "deaths"),
+        "damage_per_min": _per_min(group, "damage_to_champions"),
+        "damage_taken_per_min": _per_min(group, "damage_taken"),
+        "common_items": _top_items(group, limit=8, item_map=item_map),
+    }
+    observed_function, reason = _infer_observed_champion_function(profile)
+    profile["observed_function_id"] = observed_function
+    profile["observed_function"] = _function_zh(observed_function)
+    profile["observed_function_zh"] = _function_zh(observed_function)
+    profile["function_reason"] = reason
+    profile["function_reason_zh"] = _function_reason_zh(reason)
+    return profile
+
+
+def _infer_observed_champion_function(profile: dict[str, Any]) -> tuple[str, str]:
+    damage_share = _num(profile.get("avg_damage_share"))
+    taken_share = _num(profile.get("avg_damage_taken_share"))
+    kill_participation = _num(profile.get("avg_kill_participation"))
+    cc_time = _num(profile.get("avg_cc_time"))
+    heal = _num(profile.get("avg_heal"))
+    mitigation = _num(profile.get("avg_damage_mitigated"))
+    deaths_per_10 = _num(profile.get("deaths_per_10_min"))
+
+    reasons = []
+    if damage_share >= 0.28:
+        reasons.append("high damage share")
+    if taken_share >= 0.28:
+        reasons.append("high damage taken share")
+    if cc_time >= 28:
+        reasons.append("high CC time")
+    if heal >= 3500:
+        reasons.append("high healing")
+    if mitigation >= 25000:
+        reasons.append("high mitigation")
+    if kill_participation >= 0.72:
+        reasons.append("high kill participation")
+    if deaths_per_10 >= 6.2:
+        reasons.append("high death rate")
+
+    if taken_share >= 0.28 and (cc_time >= 18 or mitigation >= 18000):
+        function = "frontline_engage"
+    elif taken_share >= 0.28:
+        function = "frontline_tank"
+    elif heal >= 3500 and damage_share <= 0.23:
+        function = "sustain_utility"
+    elif damage_share >= 0.28 and taken_share <= 0.23:
+        function = "backline_damage_or_poke"
+    elif damage_share >= 0.28:
+        function = "primary_damage_carry"
+    elif cc_time >= 28 or kill_participation >= 0.75:
+        function = "control_or_utility"
+    elif deaths_per_10 >= 6.2 and taken_share >= 0.24:
+        function = "high_risk_initiator"
+    else:
+        function = "mixed_or_low_sample"
+
+    return function, ", ".join(reasons) or "no standout metric; infer cautiously"
+
+
+def _function_mix(champion_profiles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_function: dict[str, dict[str, Any]] = {}
+    for profile in champion_profiles:
+        function = str(profile.get("observed_function_id") or "mixed_or_low_sample")
+        entry = by_function.setdefault(
+            function,
+            {
+                "function_id": function,
+                "function": _function_zh(function),
+                "function_zh": _function_zh(function),
+                "games": 0,
+                "wins": 0,
+                "champions": [],
+                "_profiles": [],
+            },
+        )
+        entry["games"] += int(profile.get("games") or 0)
+        entry["wins"] += int(profile.get("wins") or 0)
+        entry["champions"].append(profile.get("champion"))
+        entry["_profiles"].append(profile)
+
+    output = []
+    for entry in by_function.values():
+        profiles = entry.pop("_profiles")
+        output.append(
+            {
+                "function": entry["function"],
+                "function_id": entry["function_id"],
+                "function_zh": entry["function_zh"],
+                "games": entry["games"],
+                "winrate": _ratio(entry["wins"], entry["games"]),
+                "champions": entry["champions"][:6],
+                "weighted_avg_damage_share": _weighted_profile_mean(profiles, "avg_damage_share"),
+                "weighted_avg_damage_taken_share": _weighted_profile_mean(profiles, "avg_damage_taken_share"),
+                "weighted_avg_kill_participation": _weighted_profile_mean(profiles, "avg_kill_participation"),
+                "weighted_avg_deaths_per_10_min": _weighted_profile_mean(profiles, "deaths_per_10_min"),
+            }
+        )
+    return sorted(output, key=lambda row: row["games"], reverse=True)
+
+
+def _weighted_profile_mean(profiles: list[dict[str, Any]], key: str) -> float | None:
+    numerator = 0.0
+    denominator = 0
+    for profile in profiles:
+        games = int(profile.get("games") or 0)
+        value = profile.get(key)
+        if value is None or games <= 0:
+            continue
+        numerator += _num(value) * games
+        denominator += games
+    return round(numerator / denominator, 4) if denominator else None
+
+
+def _top_champions(
+    rows: Any,
+    limit: int = 12,
+    static_maps: dict[str, dict[int, str]] | None = None,
+) -> list[dict[str, Any]]:
+    profiles = _champion_function_profiles(rows, limit=limit, static_maps=static_maps)
+    return [
+        {
+            "champion": profile["champion"],
+            "games": profile["games"],
+            "winrate": profile["winrate"],
+            "avg_kda": profile["avg_kda"],
+            "avg_deaths": profile["avg_deaths"],
+            "avg_damage": profile["avg_damage"],
+            "avg_damage_taken": profile["avg_damage_taken"],
+            "avg_damage_share": profile["avg_damage_share"],
+            "avg_damage_taken_share": profile["avg_damage_taken_share"],
+            "avg_kill_participation": profile["avg_kill_participation"],
+            "observed_function": profile["observed_function"],
+            "observed_function_id": profile["observed_function_id"],
+            "observed_function_zh": profile["observed_function_zh"],
+        }
+        for profile in profiles
+    ]
+
+
+def _top_pairs(
+    rows: Any,
+    columns: list[str],
+    limit: int = 8,
+    value_maps: list[dict[int, str]] | None = None,
+) -> list[dict[str, Any]]:
     if rows.empty:
         return []
+    value_maps = value_maps or []
     counter = Counter()
     for _, row in rows.iterrows():
         values = tuple(str(int(_num(row.get(column)))) for column in columns if _num(row.get(column)))
         if values:
             counter[values] += 1
-    return [{"ids": list(ids), "games": count} for ids, count in counter.most_common(limit)]
+    output = []
+    for ids, count in counter.most_common(limit):
+        names = []
+        for index, value in enumerate(ids):
+            value_id = int(_num(value))
+            value_map = value_maps[index] if index < len(value_maps) else {}
+            names.append(value_map.get(value_id, str(value_id)))
+        output.append({"ids": list(ids), "names": names, "games": count})
+    return output
 
 
-def _top_items(rows: Any, limit: int = 16) -> list[dict[str, Any]]:
+def _top_items(
+    rows: Any,
+    limit: int = 16,
+    item_map: dict[int, str] | None = None,
+) -> list[dict[str, Any]]:
+    item_map = item_map or {}
     counter = Counter()
     for _, row in rows.iterrows():
         for index in range(7):
             item_id = int(_num(row.get(f"item{index}")))
             if item_id:
                 counter[str(item_id)] += 1
-    return [{"item_id": item, "count": count} for item, count in counter.most_common(limit)]
+    return [
+        {
+            "item_id": item,
+            "item_name": item_map.get(int(_num(item)), str(item)),
+            "count": count,
+        }
+        for item, count in counter.most_common(limit)
+    ]
+
+
+def _load_static_maps_for_payload(data_dir: Path) -> dict[str, dict[int, str]]:
+    cache_file = data_dir / "cache" / "ddragon_zh_CN.json"
+    if not cache_file.exists() and not _truthy(os.getenv("LLM_FETCH_STATIC_MAPS")):
+        return {"champions": {}, "items": {}, "summoner_spells": {}}
+    try:
+        return load_static_maps(data_dir / "cache", language="zh_CN", refresh=False)
+    except Exception:
+        return {"champions": {}, "items": {}, "summoner_spells": {}}
+
+
+def _enrich_static_names_for_payload(rows: Any, static_maps: dict[str, dict[int, str]]) -> Any:
+    if rows.empty:
+        return rows
+    champion_map = static_maps.get("champions", {})
+    if not champion_map:
+        return rows
+
+    enriched = rows.copy()
+    if "champion_name" not in enriched.columns:
+        enriched["champion_name"] = ""
+    enriched["champion_name"] = enriched.apply(
+        lambda row: _champion_display_name(row, champion_map),
+        axis=1,
+    )
+    return enriched
+
+
+def _champion_display_name(row: Any, champion_map: dict[int, str]) -> str:
+    champion_id = int(_num(row.get("champion_id")))
+    if champion_id and champion_id in champion_map:
+        return champion_map[champion_id]
+
+    champion_name = _clean(row.get("champion_name"))
+    champion_name_id = int(_num(champion_name))
+    if champion_name_id and champion_name_id in champion_map:
+        return champion_map[champion_name_id]
+    return str(champion_name or champion_id or "")
+
+
+def _metric_glossary_zh() -> dict[str, str]:
+    return {
+        "games": "样本局数",
+        "winrate": "胜率",
+        "avg_kda": "平均 KDA",
+        "avg_deaths": "平均死亡",
+        "avg_damage_share": "队内伤害占比",
+        "avg_damage_taken_share": "队内承伤占比",
+        "avg_kill_participation": "参团率",
+        "avg_cc_time": "控制时间",
+        "avg_heal": "治疗量",
+        "avg_damage_mitigated": "自我减免伤害",
+        "deaths_per_10_min": "每 10 分钟死亡",
+        "damage_per_min": "每分钟伤害",
+        "damage_taken_per_min": "每分钟承伤",
+    }
+
+
+def _role_zh(role: str) -> str:
+    return {
+        "self": "账号本人/车队成员",
+        "squad_member": "车队成员",
+        "frequent_ally": "常见队友/疑似多排",
+    }.get(role, role)
+
+
+def _function_zh(function: str) -> str:
+    return {
+        "frontline_engage": "前排开团",
+        "frontline_tank": "前排承伤",
+        "sustain_utility": "治疗保护",
+        "backline_damage_or_poke": "后排输出/消耗",
+        "primary_damage_carry": "主力输出",
+        "control_or_utility": "控制/功能",
+        "high_risk_initiator": "高风险先手",
+        "mixed_or_low_sample": "混合职责/样本较少",
+    }.get(function, function)
+
+
+def _function_reason_zh(reason: str) -> str:
+    translations = {
+        "high damage share": "伤害占比较高",
+        "high damage taken share": "承伤占比较高",
+        "high CC time": "控制时间较高",
+        "high healing": "治疗量较高",
+        "high mitigation": "自我减免较高",
+        "high kill participation": "参团率较高",
+        "high death rate": "死亡频率较高",
+        "no standout metric; infer cautiously": "没有特别突出的指标，需要谨慎判断",
+    }
+    if not reason:
+        return ""
+    parts = [part.strip() for part in reason.split(",")]
+    return "，".join(translations.get(part, part) for part in parts if part)
+
+
+def _resolve_squad_member_names(
+    names: str | list[str] | tuple[str, ...] | None = None,
+) -> list[str]:
+    if names is None:
+        raw_names = os.getenv("LLM_SQUAD_MEMBERS")
+        names = raw_names if raw_names is not None else list(DEFAULT_SQUAD_MEMBER_NAMES)
+    if isinstance(names, str):
+        parts = re.split(r"[,，;；\n]+", names)
+    else:
+        parts = list(names)
+    output = []
+    seen = set()
+    for raw_name in parts:
+        name = str(raw_name).strip()
+        normalized = _normalize_player_alias(name)
+        if not normalized or normalized in seen:
+            continue
+        output.append(name)
+        seen.add(normalized)
+    return output
+
+
+def _detected_squad_members(
+    profiles: list[dict[str, Any]],
+    squad_member_names: list[str],
+) -> list[str]:
+    detected = []
+    for profile in profiles:
+        identity = profile.get("identity") or {}
+        for name in squad_member_names:
+            if _identity_matches_any_name(identity, [name]):
+                detected.append(name)
+                break
+    return detected
+
+
+def _rows_match_any_name(rows: Any, names: list[str]) -> bool:
+    if not names or rows.empty:
+        return False
+    targets = {_normalize_player_alias(name) for name in names if _normalize_player_alias(name)}
+    if not targets:
+        return False
+    for _, row in rows.iterrows():
+        aliases = _row_player_aliases(row)
+        if aliases & targets:
+            return True
+    return False
+
+
+def _identity_matches_any_name(identity: dict[str, Any], names: list[str]) -> bool:
+    if not names:
+        return False
+    targets = {_normalize_player_alias(name) for name in names if _normalize_player_alias(name)}
+    aliases = {
+        _normalize_player_alias(identity.get("riot_id")),
+        _normalize_player_alias(identity.get("summoner_name")),
+        _normalize_player_alias(identity.get("summoner_id")),
+    }
+    return bool((aliases - {""}) & targets)
+
+
+def _row_player_aliases(row: Any) -> set[str]:
+    aliases = set()
+    for key in ("riot_id", "summoner_name", "summoner_id", "game_name"):
+        alias = _normalize_player_alias(row.get(key))
+        if alias:
+            aliases.add(alias)
+    return aliases
+
+
+def _normalize_player_alias(value: Any) -> str:
+    text = str(_clean(value) or "").strip().casefold()
+    if not text:
+        return ""
+    if "#" in text:
+        text = text.split("#", 1)[0]
+    return re.sub(r"\s+", "", text)
+
+
+def _squad_member_order(profile: dict[str, Any], squad_member_names: list[str]) -> int:
+    identity = profile.get("identity") or {}
+    for index, name in enumerate(squad_member_names):
+        if _identity_matches_any_name(identity, [name]):
+            return index
+    return len(squad_member_names)
 
 
 def _partner_key(row: Any) -> str:
