@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,7 @@ from llm_analysis import (
     DEFAULT_TIMEOUT_SECONDS,
     LLMAnalysisError,
     build_analysis_payload,
-    build_llm_user_input,
+    build_llm_context_export,
     call_llm,
     list_analysis_skills,
     load_combined_skill_prompt,
@@ -322,8 +323,33 @@ def _llm_tab(data_dir: str) -> None:
         st.markdown("**最近表现排序参考**")
         st.json(payload["recent_performance_ranking_seed"][:8], expanded=False)
 
+    try:
+        system_prompt = load_combined_skill_prompt([skill.path for skill in selected_skills])
+        context_export = build_llm_context_export(
+            payload=payload,
+            system_prompt=system_prompt,
+            model=model.strip() or None,
+            base_url=base_url.strip() or None,
+            api_style=api_style,
+            max_output_tokens=int(max_output_tokens),
+            reasoning_effort=None if reasoning_effort == "default" else reasoning_effort,
+            timeout=int(timeout_seconds),
+            skill_paths=[skill.path for skill in selected_skills],
+        )
+    except LLMAnalysisError as exc:
+        st.error(str(exc))
+        return
+
+    st.download_button(
+        "下载完整模型上下文 JSON",
+        data=json.dumps(context_export, ensure_ascii=False, indent=2),
+        file_name=_llm_context_filename(),
+        mime="application/json",
+        use_container_width=True,
+    )
+
     with st.expander("查看将发送给模型的完整上下文", expanded=False):
-        st.json(payload, expanded=False)
+        st.json(context_export, expanded=False)
 
     if st.button("生成 LLM 分析报告", use_container_width=True):
         effective_key = api_key.strip() or None
@@ -333,8 +359,7 @@ def _llm_tab(data_dir: str) -> None:
 
         with st.spinner("正在生成分析报告..."):
             try:
-                system_prompt = load_combined_skill_prompt([skill.path for skill in selected_skills])
-                user_input = build_llm_user_input(payload)
+                user_input = context_export["user_input"]
                 report, raw_response = call_llm(
                     system_prompt=system_prompt,
                     user_input=user_input,
@@ -353,6 +378,10 @@ def _llm_tab(data_dir: str) -> None:
 
         st.success(f"报告已保存：{report_path}")
         st.markdown(report)
+
+
+def _llm_context_filename() -> str:
+    return f"llm_context_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
 
 
 def _load_rows(data_dir: str) -> pd.DataFrame:

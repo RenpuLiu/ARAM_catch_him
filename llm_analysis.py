@@ -239,6 +239,60 @@ def build_llm_user_input(payload: dict[str, Any]) -> str:
     )
 
 
+def build_llm_context_export(
+    payload: dict[str, Any],
+    system_prompt: str,
+    model: str | None = None,
+    base_url: str | None = None,
+    api_style: str | None = None,
+    max_output_tokens: int | None = None,
+    reasoning_effort: str | None = None,
+    timeout: int | None = None,
+    skill_paths: list[str | Path] | tuple[str | Path, ...] | None = None,
+) -> dict[str, Any]:
+    load_local_env()
+    model = model or os.getenv("LLM_MODEL") or "gpt-5.4"
+    base_url = (base_url or os.getenv("LLM_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+    api_style = (api_style or os.getenv("LLM_API_STYLE") or "responses").strip().lower()
+    if api_style != "chat":
+        api_style = "responses"
+    max_output_tokens = _resolve_max_output_tokens(max_output_tokens)
+    reasoning_effort = _resolve_reasoning_effort(reasoning_effort)
+    timeout = _resolve_timeout_seconds(timeout)
+
+    safe_payload = _json_safe(payload)
+    user_input = build_llm_user_input(safe_payload)
+    request_body = _build_llm_request_body(
+        api_style=api_style,
+        model=model,
+        system_prompt=system_prompt,
+        user_input=user_input,
+        max_output_tokens=max_output_tokens,
+        reasoning_effort=reasoning_effort,
+    )
+    endpoint = "chat/completions" if api_style == "chat" else "responses"
+
+    return _json_safe(
+        {
+            "metadata": {
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "api_style": api_style,
+                "api_url": f"{base_url}/{endpoint}",
+                "model": model,
+                "max_output_tokens": max_output_tokens,
+                "timeout_seconds": timeout,
+                "reasoning_effort": reasoning_effort or None,
+                "skill_paths": [Path(path).as_posix() for path in skill_paths or []],
+                "note": "Credentials are intentionally omitted.",
+            },
+            "system_prompt": system_prompt,
+            "user_input": user_input,
+            "request_body": request_body,
+            "payload": safe_payload,
+        }
+    )
+
+
 def call_llm(
     system_prompt: str,
     user_input: str,
@@ -369,20 +423,17 @@ def _call_responses(
     reasoning_effort: str,
     timeout: int,
 ) -> dict[str, Any]:
-    body: dict[str, Any] = {
-        "model": model,
-        "instructions": system_prompt,
-        "input": user_input,
-        "max_output_tokens": max_output_tokens,
-        "store": False,
-    }
-    if reasoning_effort:
-        body["reasoning"] = {"effort": reasoning_effort}
-
     return _post_json(
         url=f"{base_url}/responses",
         api_key=api_key,
-        body=body,
+        body=_build_llm_request_body(
+            api_style="responses",
+            model=model,
+            system_prompt=system_prompt,
+            user_input=user_input,
+            max_output_tokens=max_output_tokens,
+            reasoning_effort=reasoning_effort,
+        ),
         timeout=timeout,
     )
 
@@ -399,7 +450,28 @@ def _call_chat_completions(
     return _post_json(
         url=f"{base_url}/chat/completions",
         api_key=api_key,
-        body={
+        body=_build_llm_request_body(
+            api_style="chat",
+            model=model,
+            system_prompt=system_prompt,
+            user_input=user_input,
+            max_output_tokens=max_output_tokens,
+            reasoning_effort="",
+        ),
+        timeout=timeout,
+    )
+
+
+def _build_llm_request_body(
+    api_style: str,
+    model: str,
+    system_prompt: str,
+    user_input: str,
+    max_output_tokens: int,
+    reasoning_effort: str,
+) -> dict[str, Any]:
+    if api_style == "chat":
+        return {
             "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -407,9 +479,18 @@ def _call_chat_completions(
             ],
             "max_tokens": max_output_tokens,
             "temperature": 0.2,
-        },
-        timeout=timeout,
-    )
+        }
+
+    body: dict[str, Any] = {
+        "model": model,
+        "instructions": system_prompt,
+        "input": user_input,
+        "max_output_tokens": max_output_tokens,
+        "store": False,
+    }
+    if reasoning_effort:
+        body["reasoning"] = {"effort": reasoning_effort}
+    return body
 
 
 def _post_json(url: str, api_key: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:

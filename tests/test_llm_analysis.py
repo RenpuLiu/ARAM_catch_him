@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,7 @@ import requests
 from llm_analysis import (
     LLMAnalysisError,
     build_analysis_payload,
+    build_llm_context_export,
     build_llm_user_input,
     list_analysis_skills,
     load_combined_skill_prompt,
@@ -297,6 +299,47 @@ class LLMAnalysisTests(unittest.TestCase):
 
         self.assertIn('"value": 1', text)
         self.assertIn('"missing": null', text)
+
+    def test_build_llm_context_export_includes_responses_request_body(self) -> None:
+        export = build_llm_context_export(
+            payload={"value": pd.Series([1], dtype="int64").iloc[0]},
+            system_prompt="system text",
+            model="test-model",
+            base_url="https://example.test/v1",
+            api_style="responses",
+            max_output_tokens=1234,
+            reasoning_effort="low",
+            timeout=99,
+            skill_paths=[Path("skills/example/SKILL.md")],
+        )
+
+        self.assertEqual("responses", export["metadata"]["api_style"])
+        self.assertEqual("https://example.test/v1/responses", export["metadata"]["api_url"])
+        self.assertEqual(["skills/example/SKILL.md"], export["metadata"]["skill_paths"])
+        self.assertEqual("system text", export["system_prompt"])
+        self.assertIn('"value": 1', export["user_input"])
+        self.assertEqual("system text", export["request_body"]["instructions"])
+        self.assertEqual(export["user_input"], export["request_body"]["input"])
+        self.assertEqual({"effort": "low"}, export["request_body"]["reasoning"])
+        self.assertNotIn("api_key", json.dumps(export, ensure_ascii=False).lower())
+        self.assertNotIn("authorization", json.dumps(export, ensure_ascii=False).lower())
+
+    def test_build_llm_context_export_includes_chat_messages(self) -> None:
+        export = build_llm_context_export(
+            payload={"value": "ok"},
+            system_prompt="system text",
+            model="test-model",
+            api_style="chat",
+            max_output_tokens=1234,
+        )
+
+        messages = export["request_body"]["messages"]
+        self.assertEqual("chat", export["metadata"]["api_style"])
+        self.assertEqual("system", messages[0]["role"])
+        self.assertEqual("system text", messages[0]["content"])
+        self.assertEqual("user", messages[1]["role"])
+        self.assertEqual(export["user_input"], messages[1]["content"])
+        self.assertEqual(1234, export["request_body"]["max_tokens"])
 
     def test_resolve_max_output_tokens_reads_env(self) -> None:
         import os
