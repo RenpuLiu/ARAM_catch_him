@@ -30,6 +30,12 @@ def main() -> int:
         default=None,
         help="comma-separated squad member names; overrides LLM_SQUAD_MEMBERS",
     )
+    parser.add_argument(
+        "--match-id",
+        action="append",
+        default=None,
+        help="match_id to include; pass multiple times or comma-separate values",
+    )
     parser.add_argument("--model", default=None, help="override LLM_MODEL")
     parser.add_argument("--max-output-tokens", type=int, default=None, help="override LLM_MAX_OUTPUT_TOKENS")
     parser.add_argument("--timeout", type=int, default=None, help="override LLM_TIMEOUT_SECONDS")
@@ -55,6 +61,7 @@ def main() -> int:
                 min_partner_games=args.min_partner_games,
                 recent_games=args.recent_games,
                 squad_member_names=args.squad_members,
+                match_ids=args.match_id,
             )
             print(
                 {
@@ -63,6 +70,8 @@ def main() -> int:
                     "frequent_allies": len(payload["frequent_allies"]),
                     "players_for_equal_analysis": len(payload["players_for_equal_analysis"]),
                     "detected_squad_members": payload["metadata"].get("detected_squad_members"),
+                    "match_selection": payload["metadata"].get("match_selection"),
+                    "selected_match_ids": payload["metadata"].get("selected_match_ids"),
                     "skills": skill_paths,
                     "max_output_tokens": args.max_output_tokens,
                     "timeout": args.timeout,
@@ -77,6 +86,7 @@ def main() -> int:
             min_partner_games=args.min_partner_games,
             recent_games=args.recent_games,
             squad_member_names=args.squad_members,
+            match_ids=args.match_id,
             model=args.model,
             max_output_tokens=args.max_output_tokens,
             reasoning_effort=args.reasoning_effort,

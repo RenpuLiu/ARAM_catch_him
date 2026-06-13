@@ -178,6 +178,62 @@ class LLMAnalysisTests(unittest.TestCase):
         self.assertEqual("self", payload["players_for_equal_analysis"][0]["role"])
         self.assertEqual(2, len(payload["recent_performance_ranking_seed"]))
 
+    def test_build_analysis_payload_filters_selected_match_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            write_matches_csv(
+                matches_csv_path(data),
+                [
+                    {"match_id": "1", "game_creation_ms": 3, "win": True},
+                    {"match_id": "2", "game_creation_ms": 2, "win": False},
+                    {"match_id": "3", "game_creation_ms": 1, "win": True},
+                ],
+            )
+            rows = []
+            for match_id in ["1", "2", "3"]:
+                rows.extend(
+                    [
+                        {
+                            "match_id": match_id,
+                            "side": "self",
+                            "team_id": 100,
+                            "riot_id": "Me#CN1",
+                            "summoner_id": "me",
+                            "champion_name": "A",
+                            "win": match_id != "2",
+                            "kills": 10,
+                            "deaths": 5,
+                            "assists": 20,
+                            "duration_minutes": 20,
+                            "damage_to_champions": 30000,
+                            "damage_taken": 25000,
+                        },
+                        {
+                            "match_id": match_id,
+                            "side": "enemy",
+                            "team_id": 200,
+                            "riot_id": "Enemy#CN1",
+                            "summoner_id": "enemy",
+                            "champion_name": "C",
+                            "win": match_id == "2",
+                            "kills": 6,
+                            "deaths": 8,
+                            "assists": 12,
+                            "duration_minutes": 20,
+                            "damage_to_champions": 22000,
+                            "damage_taken": 20000,
+                        },
+                    ]
+                )
+            write_rows_csv(participants_csv_path(data), rows)
+
+            payload = build_analysis_payload(data, recent_games=3, match_ids=["2", "3"])
+
+        self.assertEqual("explicit_match_ids", payload["metadata"]["match_selection"])
+        self.assertEqual(["2", "3"], payload["metadata"]["selected_match_ids"])
+        self.assertEqual(2, payload["metadata"]["match_count"])
+        self.assertEqual(4, payload["metadata"]["participant_count"])
+
     def test_build_analysis_payload_includes_named_squad_member_below_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data = Path(tmp)
@@ -341,6 +397,38 @@ class LLMAnalysisTests(unittest.TestCase):
         self.assertEqual(export["user_input"], messages[1]["content"])
         self.assertEqual(1234, export["request_body"]["max_tokens"])
 
+    def test_build_llm_context_export_includes_deepseek_chat_body(self) -> None:
+        export = build_llm_context_export(
+            payload={"value": "ok"},
+            system_prompt="system text",
+            api_style="deepseek",
+            max_output_tokens=1234,
+        )
+
+        self.assertEqual("deepseek", export["metadata"]["provider"])
+        self.assertEqual("chat", export["metadata"]["api_style"])
+        self.assertEqual("https://api.deepseek.com/chat/completions", export["metadata"]["api_url"])
+        self.assertEqual("deepseek-chat", export["request_body"]["model"])
+        self.assertEqual(export["user_input"], export["request_body"]["messages"][1]["content"])
+
+    def test_build_llm_context_export_includes_anthropic_messages_body(self) -> None:
+        export = build_llm_context_export(
+            payload={"value": "ok"},
+            system_prompt="system text",
+            model="claude-test",
+            api_style="anthropic",
+            max_output_tokens=1234,
+        )
+
+        body = export["request_body"]
+        self.assertEqual("anthropic", export["metadata"]["provider"])
+        self.assertEqual("anthropic", export["metadata"]["api_style"])
+        self.assertEqual("https://api.anthropic.com/v1/messages", export["metadata"]["api_url"])
+        self.assertEqual("system text", body["system"])
+        self.assertEqual("user", body["messages"][0]["role"])
+        self.assertEqual(export["user_input"], body["messages"][0]["content"])
+        self.assertEqual(1234, body["max_tokens"])
+
     def test_resolve_max_output_tokens_reads_env(self) -> None:
         import os
 
@@ -391,6 +479,11 @@ class LLMAnalysisTests(unittest.TestCase):
         )
 
         self.assertIn("max_output_tokens", text)
+
+    def test_truncation_notice_handles_anthropic_max_tokens(self) -> None:
+        text = _with_truncation_notice("Report body", {"stop_reason": "max_tokens"})
+
+        self.assertIn("stop_reason=max_tokens", text)
         self.assertIn("LLM_MAX_OUTPUT_TOKENS", text)
         self.assertTrue(text.endswith("Report body"))
 

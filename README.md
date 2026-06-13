@@ -75,6 +75,10 @@ OPENAI_API_KEY=sk-your-key-here
 
 其他模型、网关、超时、输出长度和车队名单配置见 `.env.example`。
 
+看板的 `LLM 分析` tab 可以勾选本次进入上下文的具体对局，也可以下载完整模型上下文 JSON。
+
+`供应商/接口` 支持 OpenAI Responses、OpenAI 兼容 Chat、DeepSeek 和 Claude / Anthropic。DeepSeek 走 OpenAI 兼容 Chat Completions；Claude 走 Anthropic Messages API。常用变量见 `.env.example`。
+
 也可以直接用命令行生成报告：
 
 ```powershell
@@ -93,7 +97,13 @@ OPENAI_API_KEY=sk-your-key-here
 data/reports/
 ```
 
-如果报告被截断，把 `LLM_MAX_OUTPUT_TOKENS` 调高；如果看到 `ReadTimeout`，把 `LLM_TIMEOUT_SECONDS` 调到 `600` 或 `900`。网关只兼容 Chat Completions 时设置 `LLM_API_STYLE=chat`。
+命令行也可以指定对局：
+
+```powershell
+.\.venv\Scripts\python.exe llm_analyze.py --data data --match-id 900960308671 --match-id 900960317289
+```
+
+如果报告被截断，把 `LLM_MAX_OUTPUT_TOKENS` 调高；如果看到 `ReadTimeout`，把 `LLM_TIMEOUT_SECONDS` 调到 `600` 或 `900`。网关只兼容 Chat Completions 时设置 `LLM_API_STYLE=chat`；DeepSeek 可设置 `LLM_API_STYLE=deepseek`，Claude 可设置 `LLM_API_STYLE=anthropic`。
 
 ## 分析 Skill
 

@@ -25,6 +25,13 @@ DEFAULT_MAX_OUTPUT_TOKENS = 8000
 DEFAULT_REASONING_EFFORT = ""
 DEFAULT_TIMEOUT_SECONDS = 600
 DEFAULT_SQUAD_MEMBER_NAMES = ("tbc02", "tbc05", "tbc06", "姬载紫", "热烈后变飞灰")
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
+DEFAULT_OPENAI_MODEL = "gpt-5.4"
+DEFAULT_DEEPSEEK_MODEL = "deepseek-chat"
+DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-5"
+ANTHROPIC_VERSION = "2023-06-01"
 
 
 class LLMAnalysisError(RuntimeError):
@@ -127,11 +134,13 @@ def build_analysis_payload(
     min_partner_games: int = 2,
     recent_games: int = 50,
     squad_member_names: str | list[str] | tuple[str, ...] | None = None,
+    match_ids: str | list[str] | tuple[str, ...] | set[str] | None = None,
 ) -> dict[str, Any]:
     import pandas as pd
 
     load_local_env()
     squad_member_names = _resolve_squad_member_names(squad_member_names)
+    requested_match_ids = _normalize_match_ids(match_ids)
     data_dir = Path(data_dir)
     static_maps = _load_static_maps_for_payload(data_dir)
     matches_path = matches_csv_path(data_dir)
@@ -146,10 +155,20 @@ def build_analysis_payload(
     if matches.empty or participants.empty:
         raise LLMAnalysisError("No match or participant rows available.")
 
-    matches = _sort_recent(matches).head(recent_games)
+    matches = _sort_recent(matches)
+    if requested_match_ids is None:
+        matches = matches.head(recent_games)
+        selection_mode = "recent"
+    else:
+        matches = matches[matches["match_id"].astype(str).isin(requested_match_ids)]
+        selection_mode = "explicit_match_ids"
+        if matches.empty:
+            raise LLMAnalysisError("No selected match IDs were found in matches.csv.")
     participants = _enrich_static_names_for_payload(participants, static_maps)
     match_ids = set(matches["match_id"].astype(str))
     participants = participants[participants["match_id"].astype(str).isin(match_ids)]
+    if participants.empty:
+        raise LLMAnalysisError("Selected matches have no participant rows available.")
     self_rows = participants[participants.get("side", "") == "self"].copy()
     ally_rows = participants[participants.get("side", "").isin(["ally"])].copy()
     enemy_rows = participants[participants.get("side", "") == "enemy"].copy()
@@ -183,6 +202,8 @@ def build_analysis_payload(
             "participant_count": int(len(participants)),
             "min_partner_games": int(min_partner_games),
             "recent_games_limit": int(recent_games),
+            "match_selection": selection_mode,
+            "selected_match_ids": [str(value) for value in matches["match_id"].astype(str).tolist()],
             "squad_member_names": squad_member_names,
             "detected_squad_members": _detected_squad_members(player_profiles, squad_member_names),
             "note": "Frequent allies are inferred from repeated ally rows, not confirmed premade party data.",
@@ -251,13 +272,12 @@ def build_llm_context_export(
     skill_paths: list[str | Path] | tuple[str | Path, ...] | None = None,
 ) -> dict[str, Any]:
     load_local_env()
-    model = model or os.getenv("LLM_MODEL") or "gpt-5.4"
-    base_url = (base_url or os.getenv("LLM_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
-    api_style = (api_style or os.getenv("LLM_API_STYLE") or "responses").strip().lower()
-    if api_style != "chat":
-        api_style = "responses"
+    provider = _resolve_provider(api_style)
+    api_style = _provider_api_style(provider)
+    model = _resolve_llm_model(model, provider)
+    base_url = _resolve_base_url(base_url, provider)
     max_output_tokens = _resolve_max_output_tokens(max_output_tokens)
-    reasoning_effort = _resolve_reasoning_effort(reasoning_effort)
+    reasoning_effort = _resolve_reasoning_effort(reasoning_effort) if api_style == "responses" else ""
     timeout = _resolve_timeout_seconds(timeout)
 
     safe_payload = _json_safe(payload)
@@ -270,14 +290,14 @@ def build_llm_context_export(
         max_output_tokens=max_output_tokens,
         reasoning_effort=reasoning_effort,
     )
-    endpoint = "chat/completions" if api_style == "chat" else "responses"
 
     return _json_safe(
         {
             "metadata": {
                 "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "provider": provider,
                 "api_style": api_style,
-                "api_url": f"{base_url}/{endpoint}",
+                "api_url": _api_url(base_url, api_style),
                 "model": model,
                 "max_output_tokens": max_output_tokens,
                 "timeout_seconds": timeout,
@@ -305,16 +325,30 @@ def call_llm(
     timeout: int | None = None,
 ) -> tuple[str, dict[str, Any]]:
     load_local_env()
-    api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY")
+    provider = _resolve_provider(api_style)
+    api_style = _provider_api_style(provider)
+    model = _resolve_llm_model(model, provider)
+    base_url = _resolve_base_url(base_url, provider)
+    api_key = api_key or _resolve_api_key(provider, base_url)
     if not api_key:
-        raise LLMAnalysisError("Set OPENAI_API_KEY or LLM_API_KEY before running LLM analysis.")
+        raise LLMAnalysisError(f"Set {_api_key_hint(provider)} before running LLM analysis.")
 
-    model = model or os.getenv("LLM_MODEL") or "gpt-5.4"
-    base_url = (base_url or os.getenv("LLM_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
-    api_style = (api_style or os.getenv("LLM_API_STYLE") or "responses").strip().lower()
     max_output_tokens = _resolve_max_output_tokens(max_output_tokens)
-    reasoning_effort = _resolve_reasoning_effort(reasoning_effort)
+    reasoning_effort = _resolve_reasoning_effort(reasoning_effort) if api_style == "responses" else ""
     timeout = _resolve_timeout_seconds(timeout)
+
+    if api_style == "anthropic":
+        response = _call_anthropic_messages(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            system_prompt=system_prompt,
+            user_input=user_input,
+            max_output_tokens=max_output_tokens,
+            timeout=timeout,
+        )
+        text = _extract_anthropic_text(response)
+        return _with_truncation_notice(text, response), response
 
     if api_style == "chat":
         response = _call_chat_completions(
@@ -349,6 +383,7 @@ def generate_analysis_report(
     min_partner_games: int = 2,
     recent_games: int = 50,
     squad_member_names: str | list[str] | tuple[str, ...] | None = None,
+    match_ids: str | list[str] | tuple[str, ...] | set[str] | None = None,
     dry_run: bool = False,
     model: str | None = None,
     max_output_tokens: int | None = None,
@@ -360,6 +395,7 @@ def generate_analysis_report(
         min_partner_games=min_partner_games,
         recent_games=recent_games,
         squad_member_names=squad_member_names,
+        match_ids=match_ids,
     )
     skill_paths = _normalize_skill_paths(skill_path)
     system_prompt = load_combined_skill_prompt(skill_paths)
@@ -462,6 +498,31 @@ def _call_chat_completions(
     )
 
 
+def _call_anthropic_messages(
+    base_url: str,
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    user_input: str,
+    max_output_tokens: int,
+    timeout: int,
+) -> dict[str, Any]:
+    return _post_json(
+        url=f"{base_url}/messages",
+        api_key=api_key,
+        body=_build_llm_request_body(
+            api_style="anthropic",
+            model=model,
+            system_prompt=system_prompt,
+            user_input=user_input,
+            max_output_tokens=max_output_tokens,
+            reasoning_effort="",
+        ),
+        timeout=timeout,
+        headers=_anthropic_headers(api_key),
+    )
+
+
 def _build_llm_request_body(
     api_style: str,
     model: str,
@@ -470,6 +531,15 @@ def _build_llm_request_body(
     max_output_tokens: int,
     reasoning_effort: str,
 ) -> dict[str, Any]:
+    if api_style == "anthropic":
+        return {
+            "model": model,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_input}],
+            "max_tokens": max_output_tokens,
+            "temperature": 0.2,
+        }
+
     if api_style == "chat":
         return {
             "model": model,
@@ -493,11 +563,17 @@ def _build_llm_request_body(
     return body
 
 
-def _post_json(url: str, api_key: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:
+def _post_json(
+    url: str,
+    api_key: str,
+    body: dict[str, Any],
+    timeout: int,
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
     try:
         response = requests.post(
             url,
-            headers=_headers(api_key),
+            headers=headers or _headers(api_key),
             json=body,
             timeout=timeout,
         )
@@ -526,6 +602,103 @@ def _headers(api_key: str) -> dict[str, str]:
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+
+
+def _anthropic_headers(api_key: str) -> dict[str, str]:
+    return {
+        "x-api-key": api_key,
+        "anthropic-version": ANTHROPIC_VERSION,
+        "Content-Type": "application/json",
+    }
+
+
+def _resolve_provider(value: str | None) -> str:
+    raw_value = (value or os.getenv("LLM_API_STYLE") or "responses").strip().lower()
+    aliases = {
+        "openai": "responses",
+        "openai_responses": "responses",
+        "responses": "responses",
+        "response": "responses",
+        "openai_chat": "chat",
+        "chat": "chat",
+        "chat_completions": "chat",
+        "chat-completions": "chat",
+        "deepseek": "deepseek",
+        "anthropic": "anthropic",
+        "claude": "anthropic",
+    }
+    provider = aliases.get(raw_value)
+    if not provider:
+        raise LLMAnalysisError(f"Unsupported LLM API style: {value}")
+    return provider
+
+
+def _provider_api_style(provider: str) -> str:
+    if provider == "deepseek":
+        return "chat"
+    return provider
+
+
+def _resolve_llm_model(value: str | None, provider: str) -> str:
+    if value and value.strip():
+        return value.strip()
+    if provider == "deepseek":
+        return os.getenv("DEEPSEEK_MODEL") or DEFAULT_DEEPSEEK_MODEL
+    if provider == "anthropic":
+        return os.getenv("ANTHROPIC_MODEL") or os.getenv("CLAUDE_MODEL") or DEFAULT_ANTHROPIC_MODEL
+    return os.getenv("LLM_MODEL") or DEFAULT_OPENAI_MODEL
+
+
+def _resolve_base_url(value: str | None, provider: str) -> str:
+    if value and value.strip():
+        return value.strip().rstrip("/")
+    if provider == "deepseek":
+        return (
+            os.getenv("DEEPSEEK_BASE_URL")
+            or _compatible_llm_base_url("deepseek")
+            or DEFAULT_DEEPSEEK_BASE_URL
+        ).rstrip("/")
+    if provider == "anthropic":
+        return (
+            os.getenv("ANTHROPIC_BASE_URL")
+            or os.getenv("CLAUDE_BASE_URL")
+            or _compatible_llm_base_url("anthropic", "claude")
+            or DEFAULT_ANTHROPIC_BASE_URL
+        ).rstrip("/")
+    return (os.getenv("LLM_BASE_URL") or DEFAULT_OPENAI_BASE_URL).rstrip("/")
+
+
+def _compatible_llm_base_url(*needles: str) -> str:
+    value = os.getenv("LLM_BASE_URL", "").strip()
+    lowered = value.lower()
+    if value and any(needle in lowered for needle in needles):
+        return value
+    return ""
+
+
+def _resolve_api_key(provider: str, base_url: str) -> str | None:
+    lowered_base_url = base_url.lower()
+    if provider == "anthropic" or "anthropic" in lowered_base_url or "claude" in lowered_base_url:
+        return os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY") or os.getenv("LLM_API_KEY")
+    if provider == "deepseek" or "deepseek" in lowered_base_url:
+        return os.getenv("DEEPSEEK_API_KEY") or os.getenv("LLM_API_KEY")
+    return os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY")
+
+
+def _api_key_hint(provider: str) -> str:
+    if provider == "anthropic":
+        return "ANTHROPIC_API_KEY, CLAUDE_API_KEY, or LLM_API_KEY"
+    if provider == "deepseek":
+        return "DEEPSEEK_API_KEY or LLM_API_KEY"
+    return "OPENAI_API_KEY or LLM_API_KEY"
+
+
+def _api_url(base_url: str, api_style: str) -> str:
+    if api_style == "anthropic":
+        return f"{base_url}/messages"
+    if api_style == "chat":
+        return f"{base_url}/chat/completions"
+    return f"{base_url}/responses"
 
 
 def _resolve_max_output_tokens(value: int | None) -> int:
@@ -587,6 +760,8 @@ def _truncation_notice(response: dict[str, Any]) -> str:
     finish_reason = _first_chat_finish_reason(response)
     if finish_reason == "length":
         return "Chat Completions 返回 finish_reason=length，说明输出达到了长度上限。"
+    if response.get("stop_reason") == "max_tokens":
+        return "Anthropic Messages 返回 stop_reason=max_tokens，说明输出达到了长度上限。"
     return ""
 
 
@@ -616,6 +791,17 @@ def _extract_chat_text(response: dict[str, Any]) -> str:
     if not choices:
         raise LLMAnalysisError("Chat completion response did not contain choices.")
     return (choices[0].get("message", {}).get("content") or "").strip()
+
+
+def _extract_anthropic_text(response: dict[str, Any]) -> str:
+    chunks = []
+    for item in response.get("content", []):
+        if item.get("type") == "text":
+            chunks.append(item.get("text", ""))
+    text = "\n".join(chunk for chunk in chunks if chunk).strip()
+    if not text:
+        raise LLMAnalysisError("Anthropic response did not contain text content.")
+    return text
 
 
 def _read_skill(path: Path) -> tuple[dict[str, str], str]:
@@ -1352,6 +1538,33 @@ def _resolve_squad_member_names(
         output.append(name)
         seen.add(normalized)
     return output
+
+
+def _normalize_match_ids(
+    value: str | list[str] | tuple[str, ...] | set[str] | None = None,
+) -> list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        raw_parts = value.split(",")
+    else:
+        raw_parts = []
+        for item in value:
+            if isinstance(item, str):
+                raw_parts.extend(item.split(","))
+            else:
+                raw_parts.append(str(item))
+    ids: list[str] = []
+    seen: set[str] = set()
+    for raw_part in raw_parts:
+        match_id = str(raw_part).strip()
+        if not match_id or match_id in seen:
+            continue
+        seen.add(match_id)
+        ids.append(match_id)
+    if not ids:
+        raise LLMAnalysisError("Select at least one match for LLM analysis.")
+    return ids
 
 
 def _detected_squad_members(

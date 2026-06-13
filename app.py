@@ -12,6 +12,12 @@ import streamlit as st
 from datadragon import load_static_maps
 from llm_analysis import (
     DEFAULT_MAX_OUTPUT_TOKENS,
+    DEFAULT_ANTHROPIC_BASE_URL,
+    DEFAULT_ANTHROPIC_MODEL,
+    DEFAULT_DEEPSEEK_BASE_URL,
+    DEFAULT_DEEPSEEK_MODEL,
+    DEFAULT_OPENAI_BASE_URL,
+    DEFAULT_OPENAI_MODEL,
     DEFAULT_SQUAD_MEMBER_NAMES,
     DEFAULT_TIMEOUT_SECONDS,
     LLMAnalysisError,
@@ -245,17 +251,24 @@ def _llm_tab(data_dir: str) -> None:
         help="逗号分隔；这些成员只要出现在数据里，就会进入同维度分析。",
     )
 
+    selected_match_ids = _llm_match_selector(data_dir, int(recent_games))
+    if not selected_match_ids:
+        st.warning("请至少勾选一局参与 LLM 分析。")
+        return
+
     api_cols = st.columns([1, 1, 1])
     with api_cols[0]:
-        model = st.text_input("模型", value=os.getenv("LLM_MODEL", "gpt-5.4"))
-    with api_cols[1]:
+        api_style_options = _llm_api_style_options()
         api_style = st.selectbox(
-            "接口",
-            options=["responses", "chat"],
-            index=0 if os.getenv("LLM_API_STYLE", "responses") != "chat" else 1,
+            "供应商/接口",
+            options=api_style_options,
+            index=api_style_options.index(_default_llm_api_style(api_style_options)),
+            format_func=_llm_api_style_label,
         )
+    with api_cols[1]:
+        model = st.text_input("模型", value=_default_llm_model(api_style), key=f"llm_model_{api_style}")
     with api_cols[2]:
-        base_url = st.text_input("Base URL", value=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"))
+        base_url = st.text_input("Base URL", value=_default_llm_base_url(api_style), key=f"llm_base_url_{api_style}")
 
     generation_cols = st.columns([1, 1, 1])
     with generation_cols[0]:
@@ -289,7 +302,7 @@ def _llm_tab(data_dir: str) -> None:
         "API Key",
         value="",
         type="password",
-        placeholder="留空则读取 OPENAI_API_KEY 或 LLM_API_KEY",
+        placeholder=f"留空则读取 {_llm_api_key_hint(api_style)}",
     )
 
     selected_skills = [skill_by_label[label] for label in selected_labels]
@@ -302,6 +315,7 @@ def _llm_tab(data_dir: str) -> None:
             min_partner_games=int(min_partner_games),
             recent_games=int(recent_games),
             squad_member_names=squad_members_text,
+            match_ids=selected_match_ids,
         )
     except LLMAnalysisError as exc:
         st.error(str(exc))
@@ -353,8 +367,8 @@ def _llm_tab(data_dir: str) -> None:
 
     if st.button("生成 LLM 分析报告", use_container_width=True):
         effective_key = api_key.strip() or None
-        if not effective_key and not (os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY")):
-            st.warning("请填写 API Key，或在环境变量中设置 OPENAI_API_KEY / LLM_API_KEY。")
+        if not effective_key and not _has_llm_api_key(api_style):
+            st.warning(f"请填写 API Key，或在环境变量中设置 {_llm_api_key_hint(api_style)}。")
             return
 
         with st.spinner("正在生成分析报告..."):
@@ -382,6 +396,77 @@ def _llm_tab(data_dir: str) -> None:
 
 def _llm_context_filename() -> str:
     return f"llm_context_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+
+
+def _llm_match_selector(data_dir: str, recent_games: int) -> list[str]:
+    rows = _load_rows(data_dir)
+    if rows.empty or "match_id" not in rows.columns:
+        st.warning("没有可选择的对局。请先从 LCU 更新数据。")
+        return []
+
+    rows = rows.head(200).copy()
+    rows["match_id"] = rows["match_id"].astype(str)
+    default_ids = set(rows.head(recent_games)["match_id"].astype(str))
+    display = pd.DataFrame(
+        {
+            "参与": rows["match_id"].isin(default_ids),
+            "时间": _series_or_empty(rows, "game_creation").astype(str),
+            "胜负": _series_or_empty(rows, "win").map(lambda value: "胜" if _truthy(value) else "负"),
+            "英雄": rows.apply(_llm_match_champion_label, axis=1),
+            "K/D/A": rows.apply(_llm_match_kda, axis=1),
+            "KDA": _series_or_empty(rows, "kda").map(lambda value: _fmt(value)),
+            "输出": _series_or_empty(rows, "damage_to_champions").map(lambda value: _fmt(value, digits=0)),
+            "承伤": _series_or_empty(rows, "damage_taken").map(lambda value: _fmt(value, digits=0)),
+            "队友": _series_or_empty(rows, "teammate_names").map(lambda value: _short_text(value, 58)),
+            "match_id": rows["match_id"],
+        }
+    )
+
+    st.markdown("**参与 LLM 分析的对局**")
+    edited = st.data_editor(
+        display,
+        column_config={
+            "参与": st.column_config.CheckboxColumn("参与", help="取消勾选后，这局不会进入 LLM 上下文。"),
+            "match_id": st.column_config.TextColumn("match_id", help="用于复现同一批对局。"),
+        },
+        disabled=[column for column in display.columns if column != "参与"],
+        hide_index=True,
+        height=min(460, 38 * (len(display) + 1)),
+        num_rows="fixed",
+        use_container_width=True,
+        key=f"llm_match_selector_{recent_games}_{len(display)}",
+    )
+    selected = edited.loc[edited["参与"], "match_id"].astype(str).tolist()
+    st.caption(
+        f"默认勾选最近 {min(recent_games, len(display))} 局；当前勾选 {len(selected)} 局。"
+        "最多显示最近 200 局。"
+    )
+    return selected
+
+
+def _series_or_empty(df: pd.DataFrame, column: str) -> pd.Series:
+    if column in df.columns:
+        return df[column]
+    return pd.Series([""] * len(df), index=df.index)
+
+
+def _llm_match_champion_label(row: pd.Series) -> str:
+    champion = row.get("champion_name") or row.get("champion_id") or ""
+    return str(champion)
+
+
+def _llm_match_kda(row: pd.Series) -> str:
+    kills = _fmt(row.get("kills", ""), digits=0)
+    deaths = _fmt(row.get("deaths", ""), digits=0)
+    assists = _fmt(row.get("assists", ""), digits=0)
+    return f"{kills}/{deaths}/{assists}"
+
+
+def _short_text(value: Any, limit: int = 60) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit - 3]}..."
 
 
 def _load_rows(data_dir: str) -> pd.DataFrame:
@@ -412,6 +497,69 @@ def _filtered(rows: pd.DataFrame, aram_only: bool) -> pd.DataFrame:
 
 def _row_is_aram(row: dict[str, Any]) -> bool:
     return _truthy(row.get("is_aram")) or is_aram_game(row)
+
+
+def _llm_api_style_options() -> list[str]:
+    return ["responses", "chat", "deepseek", "anthropic"]
+
+
+def _llm_api_style_label(api_style: str) -> str:
+    return {
+        "responses": "OpenAI Responses",
+        "chat": "OpenAI 兼容 Chat",
+        "deepseek": "DeepSeek",
+        "anthropic": "Claude / Anthropic",
+    }.get(api_style, api_style)
+
+
+def _default_llm_api_style(options: list[str]) -> str:
+    raw_value = (os.getenv("LLM_API_STYLE") or "responses").strip().lower()
+    aliases = {
+        "openai": "responses",
+        "openai_responses": "responses",
+        "response": "responses",
+        "responses": "responses",
+        "openai_chat": "chat",
+        "chat": "chat",
+        "chat_completions": "chat",
+        "deepseek": "deepseek",
+        "anthropic": "anthropic",
+        "claude": "anthropic",
+    }
+    value = aliases.get(raw_value, "responses")
+    return value if value in options else options[0]
+
+
+def _default_llm_model(api_style: str) -> str:
+    if api_style == "deepseek":
+        return os.getenv("DEEPSEEK_MODEL") or DEFAULT_DEEPSEEK_MODEL
+    if api_style == "anthropic":
+        return os.getenv("ANTHROPIC_MODEL") or os.getenv("CLAUDE_MODEL") or DEFAULT_ANTHROPIC_MODEL
+    return os.getenv("LLM_MODEL") or DEFAULT_OPENAI_MODEL
+
+
+def _default_llm_base_url(api_style: str) -> str:
+    if api_style == "deepseek":
+        return os.getenv("DEEPSEEK_BASE_URL") or DEFAULT_DEEPSEEK_BASE_URL
+    if api_style == "anthropic":
+        return os.getenv("ANTHROPIC_BASE_URL") or os.getenv("CLAUDE_BASE_URL") or DEFAULT_ANTHROPIC_BASE_URL
+    return os.getenv("LLM_BASE_URL") or DEFAULT_OPENAI_BASE_URL
+
+
+def _llm_api_key_hint(api_style: str) -> str:
+    if api_style == "deepseek":
+        return "DEEPSEEK_API_KEY 或 LLM_API_KEY"
+    if api_style == "anthropic":
+        return "ANTHROPIC_API_KEY / CLAUDE_API_KEY 或 LLM_API_KEY"
+    return "OPENAI_API_KEY 或 LLM_API_KEY"
+
+
+def _has_llm_api_key(api_style: str) -> bool:
+    if api_style == "deepseek":
+        return bool(os.getenv("DEEPSEEK_API_KEY") or os.getenv("LLM_API_KEY"))
+    if api_style == "anthropic":
+        return bool(os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY") or os.getenv("LLM_API_KEY"))
+    return bool(os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY"))
 
 
 def _env_positive_int(name: str, default: int) -> int:
